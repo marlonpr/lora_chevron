@@ -1,21 +1,290 @@
-// lora_tx_hello.c
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "esp_log.h"
+#include "driver/gpio.h"
+#include "lora.h"
+
+#define LED_GPIO    GPIO_NUM_2
+#define SLAVE_ID    0   // each slave: 0 .. NUM_SLAVES-1
+#define NUM_SLAVES  2   // total number of slaves
+
+#define IRQ_RX_DONE 0x40
+#define IRQ_ALL     0xFF
+
+static QueueHandle_t dio0_q;
+static volatile uint32_t master_timestamp = 0;
+
+static void IRAM_ATTR dio0_isr(void *arg) {
+    uint8_t marker = 1;
+    BaseType_t xHigher = pdFALSE;
+    xQueueSendFromISR(dio0_q, &marker, &xHigher);
+    if (xHigher) portYIELD_FROM_ISR();
+}
+
+// LED task synchronized with master timestamp
+void led_task(void *arg) {
+    while (true) {
+        if (master_timestamp == 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            continue;
+        }
+
+        // Sleep until next 1-second tick
+        vTaskDelay(pdMS_TO_TICKS(1000));
+
+        // LED ON only if current timestamp matches slave ID modulo NUM_SLAVES
+        if ((master_timestamp % NUM_SLAVES) == SLAVE_ID)
+            gpio_set_level(LED_GPIO, 1);
+        else
+            gpio_set_level(LED_GPIO, 0);
+
+        master_timestamp++;
+    }
+}
+
+void app_main(void)
+{
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_GPIO, 0);
+
+    if (lora_init() != ESP_OK) {
+        ESP_LOGE("LORA", "init failed");
+        return;
+    }
+
+    lora_set_frequency(433000000);
+    lora_write_reg(REG_FIFO_RX_BASE_ADDR, 0x00);
+    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_RX_CONTINUOUS);
+
+    dio0_q = xQueueCreate(4, sizeof(uint8_t));
+
+    gpio_install_isr_service(0);
+    gpio_set_direction(LORA_DIO0, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(LORA_DIO0, GPIO_PULLDOWN_ONLY);
+    gpio_set_intr_type(LORA_DIO0, GPIO_INTR_POSEDGE);
+    gpio_isr_handler_add(LORA_DIO0, dio0_isr, NULL);
+
+    xTaskCreate(led_task, "led_task", 2048, NULL, 5, NULL);
+
+    uint8_t buf[32];
+
+    while (true) {
+        uint8_t marker;
+        if (xQueueReceive(dio0_q, &marker, portMAX_DELAY)) {
+            int len = lora_read_reg(REG_RX_NB_BYTES);
+            if (len > 0 && len < sizeof(buf)) {
+                uint8_t fifo_addr = lora_read_reg(REG_FIFO_RX_CURRENT);
+                lora_write_reg(REG_FIFO_ADDR_PTR, fifo_addr);
+                for (int i = 0; i < len; i++)
+                    buf[i] = lora_read_reg(REG_FIFO);
+                buf[len] = '\0';
+                master_timestamp = atoi((char*)buf); // synchronize timestamp
+            }
+            lora_write_reg(REG_IRQ_FLAGS, IRQ_ALL);
+        }
+    }
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//----------------------------------------NEW-----------------------------------
+/*
+//1️⃣ Master — low-power, timestamp broadcast
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "driver/gpio.h"
 #include "lora.h"
 
-static const char *TAG = "LORA_TX_HELLO";
+#define LED_GPIO   GPIO_NUM_2
+#define IRQ_TX_DONE 0x08
+#define IRQ_ALL     0xFF
+
+static const char *TAG = "LORA_MASTER_SYNC";
+static QueueHandle_t dio0_q;
+
+void IRAM_ATTR dio0_isr(void *arg) {
+    uint8_t marker = 1;
+    BaseType_t xHigher = pdFALSE;
+    xQueueSendFromISR(dio0_q, &marker, &xHigher);
+    if (xHigher) portYIELD_FROM_ISR();
+}
+
+void send_timestamp(uint32_t timestamp) {
+    char msg[16];
+    snprintf(msg, sizeof(msg), "%lu", (unsigned long)timestamp);
+
+    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_STDBY);
+    lora_write_reg(REG_IRQ_FLAGS, IRQ_ALL);
+    lora_write_reg(REG_FIFO_ADDR_PTR, lora_read_reg(REG_FIFO_TX_BASE_ADDR));
+    for (int i = 0; msg[i]; i++)
+        lora_write_reg(REG_FIFO, msg[i]);
+    lora_write_reg(REG_PAYLOAD_LENGTH, strlen(msg));
+    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_TX);
+
+    gpio_set_level(LED_GPIO, 1);
+}
+
+void app_main(void)
+{
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_GPIO, 0);
+
+    if (lora_init() != ESP_OK) {
+        ESP_LOGE(TAG, "LoRa init failed");
+        return;
+    }
+
+    lora_set_frequency(433000000);
+    lora_write_reg(REG_FIFO_TX_BASE_ADDR, 0x80);
+    lora_write_reg(REG_PA_CONFIG, 0x8F);
+
+    dio0_q = xQueueCreate(8, sizeof(uint8_t));
+
+    gpio_install_isr_service(0);
+    gpio_set_direction(LORA_DIO0, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(LORA_DIO0, GPIO_PULLDOWN_ONLY);
+    gpio_set_intr_type(LORA_DIO0, GPIO_INTR_POSEDGE);
+    gpio_isr_handler_add(LORA_DIO0, dio0_isr, NULL);
+
+    uint32_t timestamp = 0;
+    char buf[64];
+    TickType_t last_tick = xTaskGetTickCount();
+
+    while (true) {
+        // Wait for 1-second interval
+        vTaskDelayUntil(&last_tick, pdMS_TO_TICKS(1000));
+        last_tick = xTaskGetTickCount();
+
+        send_timestamp(timestamp);
+        ESP_LOGI(TAG, "TX timestamp: %lu", (unsigned long)timestamp);
+
+        // Poll TX_DONE
+        uint8_t marker;
+        if (xQueueReceive(dio0_q, &marker, pdMS_TO_TICKS(500)) == pdTRUE) {
+            uint8_t flags = lora_read_reg(REG_IRQ_FLAGS);
+            if (flags & IRQ_TX_DONE) {
+                ESP_LOGI(TAG, "TX_DONE #%lu", (unsigned long)timestamp);
+            }
+            lora_write_reg(REG_IRQ_FLAGS, IRQ_ALL);
+        } else {
+            ESP_LOGW(TAG, "TX timeout #%lu", (unsigned long)timestamp);
+        }
+        gpio_set_level(LED_GPIO, 0);
+
+        // RX window for ACKs (optional)
+        lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_RX_SINGLE);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_SLEEP);
+
+        timestamp++;
+    }
+}
+
+
+*/
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+/*
+
+//--------------------------------------------------------------------------//      OLD   --------------------------------------------------------------------------
+// lora_tx_hello_isr.c improved with TX ISR
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "lora.h"
+
+static const char *TAG = "LORA_TX_ISR";
+static QueueHandle_t tx_done_q;
+
+// --- IRQ Flags ---
+#define IRQ_RX_TIMEOUT      0x80
+#define IRQ_RX_DONE         0x40
+#define IRQ_PAYLOAD_CRC_ERR 0x20
+#define IRQ_VALID_HEADER    0x10
+#define IRQ_TX_DONE         0x08
+#define IRQ_ALL             0xFF
+
+// --- ISR ---
+static void IRAM_ATTR dio0_isr(void *arg)
+{
+    uint8_t marker = 1;
+    BaseType_t xHigher = pdFALSE;
+    xQueueSendFromISR(tx_done_q, &marker, &xHigher);
+    if (xHigher) portYIELD_FROM_ISR();
+}
 
 void app_main(void)
 {
     if (lora_init() != ESP_OK) {
-        ESP_LOGE(TAG, "lora_init failed");
+        ESP_LOGE(TAG, "LoRa init failed");
         return;
     }
 
     lora_set_frequency(433000000);
     lora_write_reg(REG_FIFO_TX_BASE_ADDR, 0x80);
     lora_write_reg(REG_FIFO_ADDR_PTR, 0x80);
+
+    // Map DIO0 to TxDone (default in SX127x)
+    gpio_install_isr_service(0);
+    gpio_set_direction(LORA_DIO0, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(LORA_DIO0, GPIO_PULLDOWN_ONLY);
+    gpio_set_intr_type(LORA_DIO0, GPIO_INTR_POSEDGE);
+
+    tx_done_q = xQueueCreate(4, sizeof(uint8_t));
+    gpio_isr_handler_add(LORA_DIO0, dio0_isr, NULL);
+
+    ESP_LOGI(TAG, "TX ISR ready on GPIO%d", LORA_DIO0);
 
     uint32_t counter = 0;
     char payload[64];
@@ -25,40 +294,33 @@ void app_main(void)
         if (len <= 0) len = 0;
         if (len >= (int)sizeof(payload)) len = (int)sizeof(payload)-1;
 
-        // Standby, set FIFO pointer and clear IRQs
+        // Standby, reset FIFO, clear IRQ
         lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_STDBY);
         vTaskDelay(pdMS_TO_TICKS(2));
         lora_write_reg(REG_FIFO_ADDR_PTR, lora_read_reg(REG_FIFO_TX_BASE_ADDR));
-        lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+        lora_write_reg(REG_IRQ_FLAGS, IRQ_ALL);
 
         // Write payload
         for (int i = 0; i < len; ++i) lora_write_reg(REG_FIFO, (uint8_t)payload[i]);
         lora_write_reg(REG_PAYLOAD_LENGTH, (uint8_t)len);
-
-        // PA config: PA_BOOST for most modules; switch to 0x4F if your board uses RFO
-        lora_write_reg(REG_PA_CONFIG, 0x8F);
+        lora_write_reg(REG_PA_CONFIG, 0x8F);  // PA_BOOST
 
         // Start TX
         lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_TX);
         ESP_LOGI(TAG, "TX start: \"%s\"", payload);
 
-        // Wait for TX_DONE
-        int timeout = 1000;
-        bool done = false;
-        while (timeout-- > 0) {
+        // Wait for TX_DONE via ISR
+        uint8_t marker;
+        if (xQueueReceive(tx_done_q, &marker, pdMS_TO_TICKS(1000)) == pdTRUE) {
             uint8_t flags = lora_read_reg(REG_IRQ_FLAGS);
-            if (flags & 0x08) {
-                done = true;
-                lora_write_reg(REG_IRQ_FLAGS, 0xFF);
-                break;
+            if (flags & IRQ_TX_DONE) {
+                ESP_LOGI(TAG, "TX_DONE #%u", counter);
+            } else {
+                ESP_LOGW(TAG, "Unexpected IRQ flags=0x%02X", flags);
             }
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
-
-        if (done) {
-            ESP_LOGI(TAG, "TX_DONE");
+            lora_write_reg(REG_IRQ_FLAGS, IRQ_ALL);
         } else {
-            ESP_LOGW(TAG, "TX timeout");
+            ESP_LOGW(TAG, "TX timeout #%u", counter);
         }
 
         counter++;
@@ -73,9 +335,33 @@ void app_main(void)
 
 
 
-/*
-//----------------------------------------------------------------------------SLAVE---------------------------------------------------------------------------
-// rx_minimal_fixed.c
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+//-----------------🟢 lora_rx_printstring.c (improved)
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/queue.h"
@@ -83,271 +369,18 @@ void app_main(void)
 #include "driver/gpio.h"
 #include "lora.h"
 
-static const char *TAG = "RX_MINIMAL_FIXED";
+static const char *TAG = "LORA_RX_ISR";
 static QueueHandle_t dio0_q;
 
-// Minimal IRAM ISR: only send a one-byte marker, non-blocking
-static void IRAM_ATTR dio0_isr(void *arg)
-{
-    uint8_t marker = 1;
-    BaseType_t xHigher = pdFALSE;
-    // try to send; if the queue is full, drop the marker (avoid blocking in ISR)
-    xQueueSendFromISR(dio0_q, &marker, &xHigher);
-    if (xHigher) portYIELD_FROM_ISR();
-}
-
-// Replace your lora_rx_task with this compact variant
-static void lora_rx_task(void *pv)
-{
-    uint8_t marker;
-    uint8_t buf[256];
-    uint32_t rx_count = 0;
-    uint32_t crc_errors = 0;
-    uint32_t timeouts = 0;
-
-    // Prepare continuous RX once
-    lora_write_reg(REG_FIFO_RX_BASE_ADDR, 0x00);
-    lora_write_reg(REG_FIFO_ADDR_PTR, 0x00);
-    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
-    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_RX_CONTINUOUS);
-
-    ESP_LOGI(TAG, "Receiver ready (compact diagnostics)");
-
-    for (;;) {
-        // wait for marker from ISR (marker-only ISR required)
-        if (xQueueReceive(dio0_q, &marker, portMAX_DELAY) == pdTRUE) {
-            // read flags and quick diagnostics
-            uint8_t flags = lora_read_reg(REG_IRQ_FLAGS);
-            int8_t snr = (int8_t)lora_read_reg(0x19);          // REG_PKT_SNR_VALUE
-            uint8_t rssi = lora_read_reg(REG_PKT_RSSI_VALUE);  // REG_PKT_RSSI_VALUE
-
-            if (flags & 0x40) { // RX_DONE
-                int len = lora_read_reg(REG_RX_NB_BYTES);
-                if (len > 0 && len <= (int)sizeof(buf)) {
-                    uint8_t fifo_cur = lora_read_reg(REG_FIFO_RX_CURRENT);
-                    lora_write_reg(REG_FIFO_ADDR_PTR, fifo_cur);
-                    for (int i = 0; i < len; ++i) buf[i] = lora_read_reg(REG_FIFO);
-
-                    rx_count++;
-                    if (flags & 0x20) { // CRC error
-                        crc_errors++;
-                        ESP_LOGW(TAG, "CRC ERR #%u len=%d flags=0x%02X SNR=%d RSSI=%d", crc_errors, len, flags, (int)snr, (int)rssi);
-                    } else {
-                        ESP_LOGI(TAG, "RX #%u len=%d flags=0x%02X SNR=%d RSSI=%d first=%02X",
-                                 rx_count, len, flags, (int)snr, (int)rssi, buf[0]);
-                    }
-                } else {
-                    ESP_LOGW(TAG, "Bad len=%d flags=0x%02X", len, flags);
-                }
-            } else {
-                // Not RX_DONE: handle timeout or other IRQs
-                if (flags & 0x10) { // RX_TIMEOUT
-                    timeouts++;
-                    ESP_LOGW(TAG, "RX_TIMEOUT #%u flags=0x%02X SNR=%d RSSI=%d", timeouts, flags, (int)snr, (int)rssi);
-                } else {
-                    ESP_LOGW(TAG, "IRQ not RX_DONE flags=0x%02X SNR=%d RSSI=%d", flags, (int)snr, (int)rssi);
-                }
-            }
-
-            // Clear IRQs and re-enter RX continuous
-            lora_write_reg(REG_IRQ_FLAGS, 0xFF);
-            lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_RX_CONTINUOUS);
-        }
-    }
-}
-
-
-void app_main(void)
-{
-    // Reset radio
-    gpio_reset_pin(LORA_RST);
-    gpio_set_direction(LORA_RST, GPIO_MODE_OUTPUT);
-    gpio_set_level(LORA_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(10));
-    gpio_set_level(LORA_RST, 1);
-    vTaskDelay(pdMS_TO_TICKS(10));
-
-    // Create queue BEFORE installing ISR
-    dio0_q = xQueueCreate(8, sizeof(uint8_t));
-    if (!dio0_q) {
-        ESP_LOGE(TAG, "Failed to create queue");
-        return;
-    }
-
-    if (lora_init() != ESP_OK) {
-        ESP_LOGE(TAG, "lora_init failed");
-        return;
-    }
-
-    lora_set_frequency(433000000);
-
-    // Ensure FIFO base/pointer
-    lora_write_reg(REG_FIFO_TX_BASE_ADDR, 0x80);
-    lora_write_reg(REG_FIFO_RX_BASE_ADDR, 0x00);
-
-    // Configure DIO0 input + internal pull-down to prevent floating noise
-    gpio_set_direction(LORA_DIO0, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(LORA_DIO0, GPIO_PULLDOWN_ONLY);
-
-    // Install ISR service and add handler AFTER queue created and radio configured
-    gpio_install_isr_service(0);
-    gpio_set_intr_type(LORA_DIO0, GPIO_INTR_POSEDGE);
-    gpio_isr_handler_add(LORA_DIO0, dio0_isr, NULL);
-
-    // Start RX task - give it extra stack
-    xTaskCreate(lora_rx_task, "rx_task", 6144, NULL, 5, NULL);
-    ESP_LOGI(TAG, "DIO0 ISR installed on GPIO%d", LORA_DIO0);
-    
-}
-
-
-*/
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-/*
-//master 2
-
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "esp_log.h"
-#include "lora.h"
-
-static const char *TAG = "LORA_TX_TEST";
-
-void app_main(void)
-{
-    if (lora_init() != ESP_OK) {
-        ESP_LOGE(TAG, "lora_init failed");
-        return;
-    }
-    lora_set_frequency(433000000);
-
-    // Ensure TX base
-    lora_write_reg(REG_FIFO_TX_BASE_ADDR, 0x80);
-    lora_write_reg(REG_FIFO_ADDR_PTR, 0x80);
-    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
-
-    uint8_t payload = 0xA5;
-
-    while (1) {
-        lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_STDBY);
-        vTaskDelay(pdMS_TO_TICKS(2));
-
-        // set TX pointer and clean IRQs
-        lora_write_reg(REG_FIFO_ADDR_PTR, lora_read_reg(REG_FIFO_TX_BASE_ADDR));
-        lora_write_reg(REG_IRQ_FLAGS, 0xFF);
-
-        lora_write_reg(REG_FIFO, payload);
-        lora_write_reg(REG_PAYLOAD_LENGTH, 1);
-
-        // Use PA_BOOST for most breakouts (change to 0x4F if board needs RFO)
-        lora_write_reg(REG_PA_CONFIG, 0x8F);
-
-        // Start TX
-        lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_TX);
-        ESP_LOGI(TAG, "TX started");
-
-        // Poll for TX_DONE
-        int timeout = 1000;
-        while (timeout-- > 0) {
-            uint8_t flags = lora_read_reg(REG_IRQ_FLAGS);
-            if (flags & 0x08) {
-                ESP_LOGI(TAG, "TX_DONE flags=0x%02X", flags);
-                lora_write_reg(REG_IRQ_FLAGS, 0xFF);
-                break;
-            }
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
-
-        // Dump a few regs for debug
-        ESP_LOGI(TAG, "DBG: OP=0x%02X FRF=%02X%02X%02X PA=0x%02X IRQ=0x%02X",
-                 lora_read_reg(REG_OP_MODE),
-                 lora_read_reg(REG_FRF_MSB), lora_read_reg(REG_FRF_MID), lora_read_reg(REG_FRF_LSB),
-                 lora_read_reg(REG_PA_CONFIG), lora_read_reg(REG_IRQ_FLAGS));
-
-        vTaskDelay(pdMS_TO_TICKS(2000));
-    }
-}
-
-*/
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-//----------------------------2
-/*
-// lora_rx_printstring.c
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "freertos/queue.h"
-#include "esp_log.h"
-#include "driver/gpio.h"
-#include "lora.h"
-
-static const char *TAG = "LORA_RX_PRINT";
-static QueueHandle_t dio0_q;
-
-// Minimal ISR: only queue a marker (no SPI)
+// --- IRQ Flags ---
+#define IRQ_RX_TIMEOUT      0x80
+#define IRQ_RX_DONE         0x40
+#define IRQ_PAYLOAD_CRC_ERR 0x20
+#define IRQ_VALID_HEADER    0x10
+#define IRQ_TX_DONE         0x08
+#define IRQ_ALL             0xFF
+
+// --- ISR: trigger on DIO0 rising edge ---
 static void IRAM_ATTR dio0_isr(void *arg)
 {
     uint8_t marker = 1;
@@ -364,51 +397,58 @@ static void lora_rx_task(void *pv)
     uint32_t crc_errors = 0;
     uint32_t timeouts = 0;
 
-    // Prepare RX continuous
+    // Continuous RX
     lora_write_reg(REG_FIFO_RX_BASE_ADDR, 0x00);
     lora_write_reg(REG_FIFO_ADDR_PTR, 0x00);
-    lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+    lora_write_reg(REG_IRQ_FLAGS, IRQ_ALL);
     lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_RX_CONTINUOUS);
 
-    ESP_LOGI(TAG, "Receiver ready");
+    ESP_LOGI(TAG, "Receiver ready (Continuous RX)");
 
     for (;;) {
         if (xQueueReceive(dio0_q, &marker, portMAX_DELAY) == pdTRUE) {
             uint8_t flags = lora_read_reg(REG_IRQ_FLAGS);
-            int8_t snr = (int8_t)lora_read_reg(REG_PKT_SNR_VALUE);
-            uint8_t rssi = lora_read_reg(REG_PKT_RSSI_VALUE);
+            int8_t raw_snr = (int8_t)lora_read_reg(REG_PKT_SNR_VALUE);
+            float snr_db = raw_snr / 4.0f;
 
-            if (flags & 0x40) { // RX_DONE
+            uint8_t raw_rssi = lora_read_reg(REG_PKT_RSSI_VALUE);
+            const int rssi_offset = -164; // for 433 MHz (LF port)
+            float rssi_dbm = rssi_offset + raw_rssi;
+            if (snr_db < 0.0f) rssi_dbm += snr_db;
+
+            if (flags & IRQ_RX_DONE) {
                 int len = lora_read_reg(REG_RX_NB_BYTES);
                 if (len > 0 && len < (int)sizeof(buf)) {
                     uint8_t fifo_cur = lora_read_reg(REG_FIFO_RX_CURRENT);
                     lora_write_reg(REG_FIFO_ADDR_PTR, fifo_cur);
-                    for (int i = 0; i < len; ++i) buf[i] = lora_read_reg(REG_FIFO);
+
+                    for (int i = 0; i < len; ++i)
+                        buf[i] = lora_read_reg(REG_FIFO);
                     buf[len] = '\0';
 
                     rx_count++;
-                    if (flags & 0x20) { // CRC error
+                    if (flags & IRQ_PAYLOAD_CRC_ERR) {
                         crc_errors++;
-                        ESP_LOGW(TAG, "CRC ERR #%u len=%d flags=0x%02X SNR=%d RSSI=%d",
-                                 crc_errors, len, flags, (int)snr, (int)rssi);
+                        ESP_LOGW(TAG,
+                            "CRC ERR #%u len=%d flags=0x%02X SNR=%.2f dB RSSI=%.1f dBm",
+                            crc_errors, len, flags, snr_db, rssi_dbm);
                     } else {
-                        ESP_LOGI(TAG, "RX #%u len=%d flags=0x%02X SNR=%d RSSI=%d payload=\"%s\"",
-                                 rx_count, len, flags, (int)snr, (int)rssi, (char*)buf);
+                        ESP_LOGI(TAG,
+                            "RX #%u len=%d flags=0x%02X SNR=%.2f dB RSSI=%.1f dBm payload=\"%s\"",
+                            rx_count, len, flags, snr_db, rssi_dbm, (char*)buf);
                     }
                 } else {
                     ESP_LOGW(TAG, "Invalid RX length %d flags=0x%02X", len, flags);
                 }
+            } else if (flags & IRQ_RX_TIMEOUT) {
+                timeouts++;
+                ESP_LOGW(TAG, "RX_TIMEOUT #%u flags=0x%02X", timeouts, flags);
             } else {
-                if (flags & 0x10) {
-                    timeouts++;
-                    ESP_LOGW(TAG, "RX_TIMEOUT #%u flags=0x%02X SNR=%d RSSI=%d", timeouts, flags, (int)snr, (int)rssi);
-                } else {
-                    ESP_LOGW(TAG, "IRQ not RX_DONE flags=0x%02X SNR=%d RSSI=%d", flags, (int)snr, (int)rssi);
-                }
+                ESP_LOGW(TAG, "IRQ not RX_DONE flags=0x%02X", flags);
             }
 
-            // Clear IRQ flags and continue listening
-            lora_write_reg(REG_IRQ_FLAGS, 0xFF);
+            // Clear IRQ and keep listening
+            lora_write_reg(REG_IRQ_FLAGS, IRQ_ALL);
             lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_RX_CONTINUOUS);
         }
     }
@@ -424,15 +464,15 @@ void app_main(void)
     gpio_set_level(LORA_RST, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
 
-    // Create queue and init radio
+    // Queue for DIO0 ISR
     dio0_q = xQueueCreate(8, sizeof(uint8_t));
     if (!dio0_q) {
-        ESP_LOGE(TAG, "Failed to create queue");
+        ESP_LOGE(TAG, "Failed to create DIO0 queue");
         return;
     }
 
     if (lora_init() != ESP_OK) {
-        ESP_LOGE(TAG, "lora_init failed");
+        ESP_LOGE(TAG, "LoRa init failed");
         return;
     }
 
@@ -440,22 +480,42 @@ void app_main(void)
     lora_write_reg(REG_FIFO_TX_BASE_ADDR, 0x80);
     lora_write_reg(REG_FIFO_RX_BASE_ADDR, 0x00);
 
-    // Configure DIO0 pin with internal pull-down and install ISR
+    // DIO0 pin setup
     gpio_install_isr_service(0);
     gpio_set_direction(LORA_DIO0, GPIO_MODE_INPUT);
     gpio_set_pull_mode(LORA_DIO0, GPIO_PULLDOWN_ONLY);
     gpio_set_intr_type(LORA_DIO0, GPIO_INTR_POSEDGE);
     gpio_isr_handler_add(LORA_DIO0, dio0_isr, NULL);
 
+    ESP_LOGI(TAG, "DIO0 ISR ready on GPIO%d", LORA_DIO0);
+
     xTaskCreatePinnedToCore(lora_rx_task, "lora_rx_task", 4096, NULL, 5, NULL, tskNO_AFFINITY);
-    ESP_LOGI(TAG, "DIO0 ISR installed on GPIO%d", LORA_DIO0);
 }
 
 
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 */
+
+
+//--------------------------------------------------------------------------//--------------------------------------------------------------------------
+
 
 
 

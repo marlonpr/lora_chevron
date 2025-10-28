@@ -43,6 +43,8 @@ extern "C" {
 #define MODE_STDBY              0x01
 #define MODE_TX                 0x03
 #define MODE_RX_CONTINUOUS      0x05
+#define MODE_RX_SINGLE          0x06
+
 
 // API
 esp_err_t lora_init(void);
