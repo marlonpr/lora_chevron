@@ -1,3 +1,111 @@
+//----------------------------------MASTER---------------------------
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "esp_log.h"
+#include "driver/gpio.h"
+#include "lora.h"
+
+#define LED_GPIO     GPIO_NUM_2
+#define MASTER_ID    0       // master is device 0
+#define NUM_SLAVES   3       // total devices including master
+
+#define IRQ_TX_DONE  0x08
+#define IRQ_ALL      0xFF
+
+static const char *TAG = "LORA_MASTER_SYNC";
+
+void send_timestamp(uint32_t timestamp) {
+    char msg[16];
+    snprintf(msg, sizeof(msg), "%lu", (unsigned long)timestamp);
+
+    // Standby mode before TX
+    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_STDBY);
+    lora_write_reg(REG_IRQ_FLAGS, IRQ_ALL);
+    lora_write_reg(REG_FIFO_ADDR_PTR, lora_read_reg(REG_FIFO_TX_BASE_ADDR));
+
+    // Write payload to FIFO
+    for (int i = 0; msg[i]; i++)
+        lora_write_reg(REG_FIFO, msg[i]);
+    lora_write_reg(REG_PAYLOAD_LENGTH, strlen(msg));
+
+    // Start TX
+    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_TX);
+}
+
+void app_main(void)
+{
+    // Initialize LED
+    gpio_reset_pin(LED_GPIO);
+    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(LED_GPIO, 0);
+
+    // Initialize LoRa
+    if (lora_init() != ESP_OK) {
+        ESP_LOGE(TAG, "LoRa init failed");
+        return;
+    }
+
+    lora_set_frequency(433000000);
+    lora_write_reg(REG_FIFO_TX_BASE_ADDR, 0x80);
+    lora_write_reg(REG_PA_CONFIG, 0x8F);
+
+    uint32_t timestamp = 0;
+    TickType_t last_tick = xTaskGetTickCount();
+
+    while (true) {
+        // Wait 1 second interval
+        vTaskDelayUntil(&last_tick, pdMS_TO_TICKS(1000));
+        last_tick = xTaskGetTickCount();
+
+        // Broadcast timestamp
+        send_timestamp(timestamp);
+        ESP_LOGI(TAG, "TX timestamp: %lu", (unsigned long)timestamp);
+
+        // Poll TX_DONE
+        int timeout = 200; // ms
+        while (!(lora_read_reg(REG_IRQ_FLAGS) & IRQ_TX_DONE) && timeout--) {
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        lora_write_reg(REG_IRQ_FLAGS, IRQ_ALL);
+
+        // LED ON/OFF according to master ID
+        if ((timestamp % NUM_SLAVES) == MASTER_ID)
+            gpio_set_level(LED_GPIO, 1);
+        else
+            gpio_set_level(LED_GPIO, 0);
+
+        timestamp++;
+    }
+}
+
+
+
+
+
+
+
+
+
+/*
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 //----------------------------------------SLAVE----------------------------
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -8,7 +116,7 @@
 
 #define LED_GPIO     GPIO_NUM_2
 #define SLAVE_ID     1       // unique ID for this slave (0..NUM_SLAVES-1)
-#define NUM_SLAVES   2       // total devices including master
+#define NUM_SLAVES   3       // total devices including master
 
 #define IRQ_RX_DONE  0x40
 #define IRQ_ALL      0xFF
@@ -98,103 +206,6 @@ void app_main(void)
             // Clear IRQ flags
             lora_write_reg(REG_IRQ_FLAGS, IRQ_ALL);
         }
-    }
-}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-/*
-
-
-//----------------------------------MASTER---------------------------
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-#include "esp_log.h"
-#include "driver/gpio.h"
-#include "lora.h"
-
-#define LED_GPIO     GPIO_NUM_2
-#define MASTER_ID    0       // master is device 0
-#define NUM_SLAVES   2       // total devices including master
-
-#define IRQ_TX_DONE  0x08
-#define IRQ_ALL      0xFF
-
-static const char *TAG = "LORA_MASTER_SYNC";
-
-void send_timestamp(uint32_t timestamp) {
-    char msg[16];
-    snprintf(msg, sizeof(msg), "%lu", (unsigned long)timestamp);
-
-    // Standby mode before TX
-    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_STDBY);
-    lora_write_reg(REG_IRQ_FLAGS, IRQ_ALL);
-    lora_write_reg(REG_FIFO_ADDR_PTR, lora_read_reg(REG_FIFO_TX_BASE_ADDR));
-
-    // Write payload to FIFO
-    for (int i = 0; msg[i]; i++)
-        lora_write_reg(REG_FIFO, msg[i]);
-    lora_write_reg(REG_PAYLOAD_LENGTH, strlen(msg));
-
-    // Start TX
-    lora_write_reg(REG_OP_MODE, MODE_LONG_RANGE_MODE | MODE_TX);
-}
-
-void app_main(void)
-{
-    // Initialize LED
-    gpio_reset_pin(LED_GPIO);
-    gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(LED_GPIO, 0);
-
-    // Initialize LoRa
-    if (lora_init() != ESP_OK) {
-        ESP_LOGE(TAG, "LoRa init failed");
-        return;
-    }
-
-    lora_set_frequency(433000000);
-    lora_write_reg(REG_FIFO_TX_BASE_ADDR, 0x80);
-    lora_write_reg(REG_PA_CONFIG, 0x8F);
-
-    uint32_t timestamp = 0;
-    TickType_t last_tick = xTaskGetTickCount();
-
-    while (true) {
-        // Wait 1 second interval
-        vTaskDelayUntil(&last_tick, pdMS_TO_TICKS(1000));
-        last_tick = xTaskGetTickCount();
-
-        // Broadcast timestamp
-        send_timestamp(timestamp);
-        ESP_LOGI(TAG, "TX timestamp: %lu", (unsigned long)timestamp);
-
-        // Poll TX_DONE
-        int timeout = 200; // ms
-        while (!(lora_read_reg(REG_IRQ_FLAGS) & IRQ_TX_DONE) && timeout--) {
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
-        lora_write_reg(REG_IRQ_FLAGS, IRQ_ALL);
-
-        // LED ON/OFF according to master ID
-        if ((timestamp % NUM_SLAVES) == MASTER_ID)
-            gpio_set_level(LED_GPIO, 1);
-        else
-            gpio_set_level(LED_GPIO, 0);
-
-        timestamp++;
     }
 }
 
