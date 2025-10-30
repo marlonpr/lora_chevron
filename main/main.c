@@ -54,7 +54,7 @@ void app_main(void)
 
     while (true) {
         // Wait 1 second interval
-        vTaskDelayUntil(&last_tick, pdMS_TO_TICKS(1000));
+        vTaskDelayUntil(&last_tick, pdMS_TO_TICKS(500));
         last_tick = xTaskGetTickCount();
 
         // Broadcast timestamp
